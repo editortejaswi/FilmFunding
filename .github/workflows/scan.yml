@@ -1,0 +1,71 @@
+name: scan-and-deploy
+
+# Daily scan → refresh static feed → deploy PWA to GitHub Pages.
+# One job guards BOTH free-tier timers:
+#   • the commit step is repo activity  -> Actions cron never auto-disables (60d)
+#   • the Supabase ping keeps that project from pausing (7d)
+
+on:
+  schedule:
+    - cron: "17 4 * * *"       # ~daily, off-peak, deliberately non-round minute (UTC)
+  workflow_dispatch: {}         # manual "Run workflow" button as a fallback
+  push:
+    branches: [main]            # first push auto-deploys (bot commits use GITHUB_TOKEN, which don't re-trigger)
+
+permissions:
+  contents: write               # commit refreshed data back
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scan for new film-funding opportunities
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+        run: python -m filmfund.main scan || echo "scan soft-failed; keeping existing data"
+
+      - name: Export static feed
+        run: python scripts/export_feed.py filmfund.db web/opportunities.json
+
+      - name: Keep Supabase project warm
+        env:
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ -n "$SB_URL" ] && [ -n "$SB_KEY" ]; then
+            echo "supabase ping: $(curl -s -o /dev/null -w '%{http_code}' -H "apikey: $SB_KEY" "$SB_URL/auth/v1/health")"
+          else
+            echo "Supabase secrets not set; skipping keep-warm"
+          fi
+
+      - name: Commit refreshed data (heartbeat)
+        run: |
+          git config user.name  "filmfund-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > web/last_scanned.txt
+          git add -A
+          git commit -m "chore: daily scan $(date -u +%F)" || echo "no changes to commit"
+          git push || echo "push skipped"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,10 @@
+# never commit secrets or built binaries
+secrets.json
+filmfund/secrets.json
+*.apk
+# python noise
+__pycache__/
+*.pyc
+.venv/
+# os noise
+.DS_Store
